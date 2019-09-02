@@ -1,0 +1,778 @@
+---
+title: "MovieLens Project"
+author: "Charles Suresh"
+date: "27/08/2019"
+geometry: "left=1cm,right=1cm,top=1cm,bottom=2cm"
+output:
+  pdf_document: 
+    number_sections: true
+    toc: true
+    toc_depth: 3
+    latex_engine: xelatex
+documentclass: article
+classoption: letter
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r Create edx and validation sets, include=FALSE}
+################################
+# Create edx set, validation set
+################################
+
+# Note: this process could take a couple of minutes
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+
+set.seed(1, sample.kind="Rounding")
+# if using R 3.5 or earlier, use `set.seed(1)` instead
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+
+validation <- temp %>% 
+     semi_join(edx, by = "movieId") %>%
+     semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+
+```
+
+```{r Installing Packages, include=FALSE}
+if(!require(lubridate)) install.packages("lubridate", repos = "http://cran.us.r-project.org")
+if(!require(Metrics)) install.packages("Metrics", repos = "http://cran.us.r-project.org")
+```
+# Overview
+
+This Report is related to the MovieLens Project under HarvardX Data Science Course: PH125.9x. The MovieLens Project in this course requires the creation of a movie recommendation system using the MovieLens dataset. Recommender Systems are systems that seek to predict or filter preferences according to user’s choices. The data provided is from the MovieLens 10M set (i.e. 10 million ratings), a much larger version of the data set contained in the dslabs library used during the course. The given data set 'edx' used for training the model has approximately 9 million ratings. The outcome that we need to predict is the rating $Y_{u, i}$ given by the user u for a given movie i. The features that we can use to predict the ratings $Y_{u, i}$ are:
+
+```{r Features, echo=FALSE}
+colnames(edx[-3]) #Show all column names except for 'ratings'
+```
+
+The edx dataset will be partitioned into a training and a test set.
+Different models will be built using the training set. The Movie ratings predictions from these models will be compared to the true ratings in the test subset
+using RMSE. The model with the lowest RMSE will be chosen to train on the entire edx set and make the final predictions on the validation set.
+These predictions on the validation set will be compared to the true ratings using Root Mean Squared Error(RMSE).
+
+Least Square Estimates along with Regularisation will be used to make the predictions. Since the R Script needs to run on consumer grade computers for peer grading, compute intensive methods of predicting such as Matrix Factorization, singular value decomposition (SVD) and principal component analysis (PCA), all of which could lead to lower RMSEs, are avoided. 
+
+# Data Cleaning, Analysis and Visualisation
+
+The data given in the edx dataset is already in tidy format (as seen below). Thereby, Data Wrangling of any form is not needed.
+
+```{r Data_Cleaning}
+# Displaying the first 6 entries
+head(edx) %>% 
+  knitr::kable()
+```
+
+
+## Movie Effect
+
+By plotting the average rating of each movie, it can be seen that there is considerable variability among different movies.
+Some movies are generally rated higher than others, while others are much lower than the average.
+
+```{r movie_averages, fig.width=6, fig.height=3}
+#Group by Movie ID and plot the mean rating for each movie
+edx %>% group_by(movieId) %>% 
+  summarize(mean = mean(rating)) %>%
+  ggplot(aes(x=mean)) +
+  geom_histogram(bins=10,color=I("black")) +
+  ggtitle("Average Movie Ratings")
+```
+
+## User Effect
+
+By plotting the average ratings given by each user, it can be seen that there is considerable variability across users as well.
+Some users give very poor ratings on average, while others give very good reviews.
+
+```{r user_differences, fig.width=6, fig.height=3}
+#Group by User ID and plot the mean ratings given by each user
+edx %>% group_by(userId) %>%
+  summarise(mean=mean(rating)) %>% 
+  ggplot(aes(mean)) +
+  geom_histogram(bins=30,color=I("black")) +
+  ggtitle("Average User rating")
+
+```
+
+## Time Effect
+
+On computing and plotting the average rating against each day, it can be seen that time has some effect on the average rating.
+This could be an indiciation of the interests and habits of society changing over time.
+
+```{r average_rating_by_week, warning=FALSE, message=FALSE, fig.width=6, fig.height=3}
+#Group ratings by date and plot the smoothed conditional mean over the days
+edx %>% mutate(time=as_datetime(timestamp)) %>% #Converting epoch time to human readable time
+  group_by(day=floor_date(time,"day")) %>% #rounding date-time down to nearest day
+  summarise(mean_rating=mean(rating)) %>%
+  ggplot(aes(day,mean_rating)) + 
+  geom_smooth(method='loess', formula = y~x) +
+  ggtitle("Variation of Average Rating over time")
+
+```
+
+## Genre Effect
+
+On plotting error bar plots for average ratings of movies grouped by genres with more than 50,000 ratings, evidence of genre effect is found.
+
+```{r genre_effect, fig.width=6, fig.height=4}
+#Group ratings by genres and plot the error bar plots for genres with over 50,000 ratings
+edx %>% group_by(genres) %>%
+  summarize(n=n(),avg=mean(rating),se=sd(rating)/sqrt(n())) %>% #mean and standard errors
+  filter(n >= 50000) %>% #Keeping genres with ratings over 50,000
+  mutate(genres = reorder(genres, avg)) %>% #order genres by mean ratings
+  ggplot(aes(x=genres,y=avg,ymin=avg-2*se,ymax=avg+2*se)) + #lower and upper confidence intervals
+  geom_point() +
+  geom_errorbar() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  ggtitle("Average Ratings of Genres with >=50,000 Ratings")
+
+```
+
+Also, on plotting error bar plots for average ratings of movies grouped by genres, regardless of the number of ratings, evidence of genre effect is found.
+
+Some of the genres have large standard errors.
+
+```{r genre_effect_2, fig.width=6, fig.height=3}
+#Group ratings by genres and plot the error bar plots for all genres
+edx %>% group_by(genres) %>%
+  summarize(n=n(),avg=mean(rating),se=sd(rating)/sqrt(n())) %>% #mean and standard errors
+  filter(n>1) %>%
+  mutate(genres = reorder(genres, avg)) %>% #order genres by mean ratings
+  ggplot(aes(x=genres,y=avg,ymin=avg-2*se,ymax=avg+2*se)) + #lower and upper confidence intervals
+  geom_point() +
+  geom_errorbar() + 
+  theme(axis.text.x = element_blank()) + #Removing X-Axis Genre labels
+  ggtitle("Average Ratings of Different Genres")
+
+```
+
+
+# Data Modelling
+
+The edx dataset is split into training and test datasets.
+The train set will be the subset used to train different models.
+The test set will be the subset used to test and evaluate the trained models.
+
+Once the model has been finalized and the tuning parameters chosen, the entire edx set will be used to train the final model and make predictions on the validation set.
+
+```{r Data Partition, message=FALSE, warning=FALSE}
+# Create train and test subsets from the edx set
+# Test set will be 20% of the edx set
+set.seed(1, sample.kind="Rounding")
+test_index <- createDataPartition(y = edx$rating, times = 1,p = 0.2, list = FALSE)
+train_set <- edx[-test_index,]
+test_set <- edx[test_index,]
+
+# Make sure userId and movieId in test set are also in train set
+test_set <- test_set %>% 
+  semi_join(train_set, by = "movieId") %>%
+  semi_join(train_set, by = "userId")
+```
+
+## Naive Bayes
+
+The first model assumes the same rating for all movies and all users, with all the differences explained by random variation: If $\mu$ represents the true rating for all movies and users and $\epsilon$  represents independent errors sampled from the same distribution centered at zero, then: 
+
+$Y_{u, i} = \mu + b_i + \epsilon_{u, i}$
+
+In this case, the least squares estimate of $\mu$ — the estimate that minimizes the root mean squared error — is the average rating of all movies across all users.
+
+The average rating for the train set is:
+
+```{r mean}
+# Calculating mean rating
+mu <- mean(train_set$rating)
+mu
+```
+
+The residual mean squared error is then computed by comparing the predicted ratings with the true ratings in the test set: 
+
+```{r naive rmse}
+# Calculating RMSE
+naive_rmse <- RMSE(test_set$rating, mu)
+naive_rmse
+```
+We see that the baseline RMSE is 1.059904
+A table is created to store the RMSE results obtained from different models.
+
+```{r rmse results table 1,warning=FALSE, error=FALSE}
+# Creating a data frame to store RMSEs
+rmse_results <- data_frame(Method = "Just the average", RMSE = naive_rmse)
+print.data.frame(rmse_results)
+```
+
+## Movie Effect
+
+From data exploration and visualisation we had observed that there is evidence of a movie effect.
+We can improve our model by adding a term,  $b_i$, that represents the average rating for movie  i :
+
+$Y_{u, i} = \mu + b_i + \epsilon_{u, i}$
+
+$b_i$ is the average of $Y_{u, i}$ minus the overall mean $\mu$ for each movie i.
+
+We can use least squares to estimate the $b_i$ using the lm function. But, becuase there are over ten thousand movies, a $b_i$ needs to be assigned for each movie which would make the lm function very slow here.
+
+In this particular situation, we know that the least square estimate $b_i$ is just the average of $Y_{u,i} - \hat{\mu}$ for each movie i.
+
+So, it is computed this way:
+
+```{r b_i calculation}
+# Computing b_i for each movie as mean of residuals
+b_i <- train_set %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))
+
+```
+
+RMSE is then calculated after incorporating the Movie Effect.
+
+```{r predicted ratings using b_i}
+# Predicting movie ratings
+predicted_ratings <- mu + test_set %>% 
+  left_join(b_i, by='movieId') %>%
+  .$b_i
+
+# Calculating RMSE
+model_1_rmse <- RMSE(predicted_ratings, test_set$rating)
+
+# Storing the RMSE result in the rmse_results dataframe
+rmse_results <- bind_rows(rmse_results,
+    data_frame(Method="Movie Effect Model",
+    RMSE = model_1_rmse ))
+
+print.data.frame(rmse_results)
+```
+We see that the RMSE has improved by around 11% to 0.9437429
+
+## User Effect
+
+We also know that there is evidence of a user effect from data exploration and visulatisation done earlier.
+
+We can improve our model by adding another term, $b_u$, that represents the average rating given by user u:
+
+$Y_{u,i} = \mu + b_i + b_u + \varepsilon_{u,i}$
+
+where $b_u$ is a user-specific effect
+
+If a user who gives poor ratings on average (negative $b_u$) rates a great movie (positive $b_i$), the effects counter each other. We may be able to get close to the correct prediction, thereby reducing the RMSE.
+
+Least squares can again be used to estimate the $b_u$. But, becuase there are close to seventy thousand users, a $b_u$ needs to be assigned to each user. The lm function would, again, be very slow here.
+
+$b_u$ can instead be estimated as the average of $y_{u,i} - \mu - \hat{b}_i$
+
+```{r user differences RMSE}
+# Computing b_u for each user as mean of residuals
+  b_u <- train_set %>% 
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/n())
+
+# Predicting movie ratings on test set
+  predicted_ratings <- 
+    test_set %>% 
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = mu + b_i + b_u) %>%
+    .$pred
+
+# Calculating RMSE and Storing the RMSE result in the rmse_results dataframe  
+model_2_rmse <- RMSE(predicted_ratings, test_set$rating)
+
+rmse_results <- bind_rows(rmse_results,
+    data_frame(Method="Movie + User Effects",
+    RMSE = model_2_rmse ))
+print.data.frame(rmse_results)
+
+```
+After incorporating the User effects, we see that the RMSE has improved by another 9% to 0.865932
+
+## Time Effect
+
+Through data exploration and visualisation we found that there is some time effect on the movie ratings.
+
+If we define $d_{u,i}$ as the day for user's u rating of movie i, the rating $Y_{u,i}$ can be written as:
+
+$Y_{u,i} = \mu + b_i + b_u + f(d_{u,i}) + \varepsilon_{u,i}$ with f a smooth function of $d_{u,i}$
+
+The smooth function $f(d_{u,i})$ can be approximated by a least square estimate $b_t$ for each day.
+
+Thus, the rating $Y_{u,i}$ can be re-written as:
+
+$Y_{u,i} = \mu + b_i + b_u + b_t + \varepsilon_{u,i}$
+
+where $t = t_{u,i}$
+
+Again, estimating $b_t$ as the average of $y_{u,i} - \mu - \hat{b}_i - \hat{b}_u$, because of our computational constraints:
+
+```{r RMSE results 3}
+# Computing b_t for each day as mean of residuals
+b_t <- train_set %>% 
+    left_join(b_u, by="userId") %>% 
+    left_join(b_i, by = "movieId") %>% 
+    mutate(time=as_datetime(timestamp)) %>% #Converting epoch time to human readable time
+    group_by(day=floor_date(time,"day")) %>% #rounding date-time down to nearest day
+    summarise(b_t=sum(rating-b_i-b_u-mu)/n())
+
+# Predicting movie ratings on test set
+predicted_ratings <- test_set %>% 
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(day=floor_date(as_datetime(timestamp),"day")) %>% #rounding date-time down to nearest day
+    left_join(b_t, by="day") %>%
+    mutate(b_t=replace_na(b_t,0)) %>% #Replacing NA values with 0
+    mutate(pred = mu + b_i + b_u + b_t) %>%
+   .$pred
+
+# Calculating RMSE and Storing the RMSE result in the rmse_results dataframe   
+model_3_rmse <- RMSE(predicted_ratings, test_set$rating)
+rmse_results <- bind_rows(rmse_results,
+    data_frame(Method="Movie + User Effects + Time effect",
+    RMSE = model_3_rmse ))
+print.data.frame(rmse_results)
+
+```
+
+We can see that including a time effect estimate in the model lowers the RMSE of our predictions to 0.8654403
+
+## Genre Effect
+
+We know from data exploration and visualisation that different genres have different average ratings.
+
+We can improve our model even further by adding adding a least square estimate, $b_g$, that estimates the effect of each genre:
+
+$Y_{u,i} = \mu + b_i + b_u + b_t + b_g + \varepsilon_{u,i}$
+
+where $t = t_{u,i}$ and $g = g_{u,i}$
+
+Instead of using the lm function, we estimate $b_g$ as the average of residual: $y_{u,i} - \mu - \hat{b}_i - \hat{b}_u -\hat{b}_t$
+
+```{r genre effect model}
+# Computing b_g for each genre as mean of residuals
+b_g <- train_set %>% 
+    left_join(b_u, by="userId") %>% 
+    left_join(b_i, by = "movieId") %>% 
+    mutate(day=floor_date(as_datetime(timestamp),"day")) %>%
+    left_join(b_t, by="day") %>%
+    mutate(b_t=replace_na(b_t,0)) %>%
+    group_by(genres) %>%
+    summarise(b_g=(sum(rating-b_i-b_u-b_t-mu))/(n()))
+
+# Predicting movie ratings on test set
+predicted_ratings <- test_set %>% 
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(day = floor_date(as_datetime(timestamp),"day")) %>% 
+    left_join(b_t, by="day") %>%
+    mutate(b_t=replace_na(b_t,0)) %>% #Replacing NA values with 0
+    left_join(b_g, by="genres") %>%
+    mutate(b_g=replace_na(b_g,0)) %>% #Replacing NA values with 0
+    mutate(pred = mu + b_i + b_u + b_t + b_g) %>%
+    .$pred
+
+# Calculating RMSE and storing the RMSE result in the rmse_results dataframe 
+model_4_rmse <- RMSE(predicted_ratings, test_set$rating)
+
+rmse_results <- bind_rows(rmse_results,
+    data_frame(Method="Movie + User + Time + Genre Effects",
+    RMSE = model_4_rmse ))
+print.data.frame(rmse_results)
+
+```
+
+With a Genre effect included in the model, the RMSE decreases to 0.865104
+
+We had seen from an earlier error bar plot "Average ratings of Different Genres" that some genres have high standard errors.
+We can filter out genres with high standard errors on their mean ratings to further decrease the RMSE. For genres having high standard errors, it is better to be conservative and not assign a $b_g$ value.
+
+For determining the cutoff value of the standard error, we use cross-validation.
+
+```{r genre effect with se}
+# Using cross validation to determine the optimal standard Error cut off value
+ses <- seq(0,1,0.1) #Range of Standard Error values
+rmses <- sapply(ses, function(s){
+b_g <- train_set %>% 
+        left_join(b_u, by="userId") %>% 
+        left_join(b_i, by = "movieId") %>% 
+        mutate(day = floor_date(as_datetime(timestamp),"day")) %>%
+        left_join(b_t, by="day") %>%
+        mutate(b_t=replace_na(b_t,0)) %>%
+        group_by(genres) %>%
+        summarise(b_g=(sum(rating-b_i-b_u-b_t-mu))/(n()),se = sd(rating)/sqrt(n())) %>%
+        filter(se<=s) # Retaining b_g values that correspond to Standard Error less than or equal to S 
+
+# Predicting movie ratings on test set   
+predicted_ratings <- test_set %>% 
+        left_join(b_i, by = "movieId") %>%
+        left_join(b_u, by = "userId") %>%
+        mutate(day = floor_date(as_datetime(timestamp),"day")) %>% 
+        left_join(b_t, by="day") %>%
+        mutate(b_t=replace_na(b_t,0)) %>%
+        left_join(b_g, by="genres") %>%
+        mutate(b_g=replace_na(b_g,0)) %>%
+        mutate(pred = mu + b_i + b_u + b_t + b_g) %>%
+        .$pred
+    
+    RMSE(predicted_ratings, test_set$rating)
+    return(RMSE(predicted_ratings, test_set$rating))
+})
+
+# Storing the optimal standard error error value i.e the one which gives lowest RMSE
+s_e <- ses[which.min(rmses)]
+s_e
+```
+We see from cross-validation that the optimal standard error cut off value is 0.6.
+
+```{r model 7 rmse}
+# Storing the minimum RMSE value in the rmse_results dataframe
+model_5_rmse <- min(rmses)
+
+rmse_results <- bind_rows(rmse_results,
+     data_frame(Method="Movie + User + Time + Genre Effects with se Cutoff",
+     RMSE = model_5_rmse ))
+print.data.frame(rmse_results)
+
+```
+
+We also see that when we use a Standard Error cutoff of 0.6, the RMSE reduces to 0.8651031 
+
+## Regularisation
+
+We can see that the top 10 best movies based on the $b_i$ are relatively obscure with very few ratings (n)
+
+```{r top 10 movies, echo= FALSE}
+# Extracting all the movie titles
+movie_titles <- train_set %>% 
+     select(movieId, title) %>%
+     distinct()
+
+# Sorting movies by b_i values (descending)
+train_set %>% dplyr::count(movieId) %>% 
+  left_join(b_i, by="movieId") %>%
+  left_join(movie_titles, by="movieId") %>%
+  arrange(desc(b_i)) %>% 
+  select(title, b_i, n) %>% 
+  slice(1:10) %>% 
+  knitr::kable()
+```
+
+We can also see that the top 10 worst movies based on the $b_i$ are relatively obscure with very few ratings (n)
+
+```{r bottom 10 movies, echo= FALSE}
+# Sorting movies by b_i values (ascending)
+train_set %>% dplyr::count(movieId) %>% 
+  left_join(b_i, by="movieId") %>%
+  left_join(movie_titles, by="movieId") %>%
+  arrange(b_i) %>% 
+  select(title, b_i, n) %>% 
+  slice(1:10) %>% 
+  knitr::kable()
+```
+
+Also, the top 10 users with the lowest and highest $b_u$, have rated relatively few movies (n).
+
+```{r bottom 10 users, echo= FALSE}
+# Sorting users by b_u values (ascending)
+t3 <- train_set %>% dplyr::count(userId) %>% 
+left_join(b_u, by="userId") %>%
+arrange((b_u)) %>% 
+select(userId, b_u,n) %>% 
+slice(1:10)
+
+```
+```{r top 10 users, echo= FALSE}
+# Sorting users by b_u values (descending)
+t4 <- train_set %>% dplyr::count(userId) %>% 
+left_join(b_u, by="userId") %>%
+arrange(desc(b_u)) %>% 
+select(userId, b_u,n) %>% 
+slice(1:10)
+
+```
+```{r results='asis', echo=FALSE}
+    # Setting `results = 'asis'` allows for using Latex within the code chunk
+    cat('\\begin{center}')
+    # `{c c}` Creates a two column table
+    # Use `{c | c}` if you'd like a line between the tables
+    cat('\\begin{tabular}{ c | c }')
+    print(knitr::kable(t3, format = 'latex'))
+    # Separate the two columns with an `&`
+    cat('&')
+    print(knitr::kable(t4, format = 'latex'))
+    cat('\\end{tabular}')
+    cat('\\end{center}')
+```
+
+When we look at the top 10 dates with the highest and lowest $b_t$ values, we can see that a lot of these dates have very few number of ratings.
+
+```{r top 10 b_t, echo= FALSE}
+# Sorting days by b_t values (descending)
+t1 <- train_set %>%
+  mutate(day = floor_date(as_datetime(timestamp),"day")) %>%
+  dplyr::count(day) %>% 
+  left_join(b_t, by="day") %>%
+  arrange(desc(b_t)) %>% 
+  select(day, b_t,n) %>% 
+  slice(1:10)
+```
+```{r bottom 10 b_t, echo= FALSE}
+# Sorting days by b_t values (ascending)
+t2 <- train_set %>%
+  mutate(day = floor_date(as_datetime(timestamp),"day")) %>%
+  dplyr::count(day) %>% 
+  left_join(b_t, by="day") %>%
+  arrange(b_t) %>% 
+  select(day, b_t,n) %>% 
+  slice(1:10)
+```
+```{r results='asis', echo=FALSE}
+    # Setting `results = 'asis'` allows for using Latex within the code chunk
+    cat('\\begin{center}')
+    # `{c c}` Creates a two column table
+    # Use `{c | c}` if you'd like a line between the tables
+    cat('\\begin{tabular}{ c | c }')
+    print(knitr::kable(t1, format = 'latex'))
+    # Separate the two columns with an `&`
+    cat('&')
+    print(knitr::kable(t2, format = 'latex'))
+    cat('\\end{tabular}')
+    cat('\\end{center}')
+```
+
+When we look at the top 10 genres with the highest and lowest $b_g$ values, it can again be observed that some of these genres have very few ratings
+
+```{r top 10 b_g, echo= FALSE}
+# Sorting genres by b_g values (descending)
+train_set %>% dplyr::count(genres) %>% 
+  left_join(b_g, by="genres") %>%
+  arrange(desc(b_g)) %>% 
+  select(genres, b_g,n) %>% 
+  slice(1:10) %>% 
+  knitr::kable()
+```
+```{r bottom 10 b_g, echo= FALSE}
+# Sorting genres by b_g values (ascending)
+train_set %>% dplyr::count(genres) %>% 
+  left_join(b_g, by="genres") %>%
+  arrange(b_g) %>% 
+  select(genres, b_g,n) %>% 
+  slice(1:10) %>% 
+  knitr::kable()
+  
+```
+
+
+
+Since large errors can increase the RMSE, it is be better to be conservative when unsure.
+
+Regularization can be used to constrain the total variability of the effect sizes by penalizing large estimates that come from small sample sizes.
+Instead of minimizing the least square equation, we minimize an equation that adds a penalty.
+
+$\frac{1}{N} \sum_{u,i} \left(y_{u,i} - \mu - b_i - b_u - b_t - b_g \right)^2 + \lambda \left(\sum_{i} b_i^2 + \sum_{u} b_u^2 + \sum_{t} b_t^2 + \sum_{g} b_g^2\right)$
+
+where $t = t_{u,i}$ and $g = g_{u,i}$
+
+Since $\lambda$ is a tuning parameter, cross-validation can be used to choose its optimal value.
+
+```{r lambda_plot, fig.width=6, fig.height=3}
+#performing cross-validation using different lambda values
+lambdas <- seq(0, 10, 0.25)
+rmses <- sapply(lambdas, function(l){
+mu <- mean(train_set$rating)
+
+b_i <- train_set %>%
+group_by(movieId) %>%
+summarize(b_i = sum(rating - mu)/(n()+l))
+
+b_u <- train_set %>% 
+left_join(b_i, by="movieId") %>%
+group_by(userId) %>%
+summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+
+b_t<-train_set %>% 
+left_join(b_u, by="userId") %>% 
+left_join(b_i, by = "movieId") %>% 
+mutate(time=as_datetime(timestamp)) %>% 
+group_by(day=floor_date(time,"day")) %>% 
+summarise(b_t=sum(rating-b_i-b_u-mu)/(n()+l))
+
+b_g<-train_set %>% 
+left_join(b_u, by="userId") %>% 
+left_join(b_i, by = "movieId") %>% 
+mutate(day=floor_date(as_datetime(timestamp),"day")) %>%
+left_join(b_t, by="day") %>%
+mutate(b_t=replace_na(b_t,0)) %>%
+group_by(genres) %>%
+summarise(b_g=(sum(rating-b_i-b_u-b_t-mu))/(n()+l),se = sd(rating)/sqrt(n())) %>%
+filter(se<=s_e)
+
+# Making predictions on the test set
+predicted_ratings <- test_set %>% 
+left_join(b_i, by = "movieId") %>%
+left_join(b_u, by = "userId") %>%
+mutate(day=floor_date(as_datetime(timestamp),"day")) %>% 
+left_join(b_t, by="day") %>%
+mutate(b_t=replace_na(b_t,0)) %>%
+left_join(b_g, by="genres") %>%
+mutate(b_g=replace_na(b_g,0)) %>%
+mutate(pred = mu + b_i + b_u + b_t + b_g) %>%
+.$pred
+RMSE(predicted_ratings, test_set$rating)
+return(RMSE(predicted_ratings, test_set$rating))
+})
+
+#Plotting Lambda values vs RMSE
+ggplot(data.frame(Lambda=lambdas,RMSE=rmses),aes(Lambda,RMSE)) +
+  geom_point() +
+  ggtitle("Lambda Plot")
+
+```
+
+
+We find that the optimal value of lambda is 5.25
+
+```{r optimal lambda}
+# Storing the optimal Lambda value i.e the one which gives lowest RMSE
+lambda <- lambdas[which.min(rmses)]
+lambda
+
+```
+
+After regularisation, we also find that the RMSE value on our test set predictions has reduced substantially to 0.8643941
+
+```{r RMSE results 4}
+# Storing the minimum RMSE value in the rmse_results dataframe
+model_6_rmse <- min(rmses)
+rmse_results <- bind_rows(rmse_results,
+      data_frame(Method="Reglarised Movie + User + Time + Genre Effects",
+      RMSE = model_6_rmse ))
+print.data.frame(rmse_results)
+```
+\pagebreak
+
+# Results
+
+We have finalised our model to minimize this equation:
+
+$\frac{1}{N} \sum_{u,i} \left(y_{u,i} - \mu - b_i - b_u - b_t - b_g \right)^2 + \lambda \left(\sum_{i} b_i^2 + \sum_{u} b_u^2 + \sum_{t} b_t^2 + \sum_{g} b_g^2\right)$
+
+where $t = t_{u,i}$ and $g = g_{u,i}$
+
+with tuning paramter $\lambda = 5.25$
+
+We can now use this model and the tuning parameters to train using the entire edx dataset and then make predictions on the validation set.
+
+
+```{r RMSE on final}
+# Training final model using edx dataset
+mu <- mean(edx$rating) # Calculating mean rating in edx set
+
+# Computing b_i for each movie as mean of residuals
+b_i <- edx %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+lambda))
+
+# Computing b_u for each user as mean of residuals
+b_u <- edx %>% 
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+lambda))
+
+# Computing b_t for each day as mean of residuals
+b_t <-edx %>% 
+    left_join(b_u, by="userId") %>% 
+    left_join(b_i, by = "movieId") %>% 
+    mutate(time=as_datetime(timestamp)) %>% 
+    group_by(day=floor_date(time,"day")) %>% 
+    summarise(b_t=sum(rating-b_i-b_u-mu)/(n()+lambda))
+
+# Computing b_g for each genre as mean of residuals
+b_g <- edx %>% 
+    left_join(b_u, by="userId") %>% 
+    left_join(b_i, by = "movieId") %>% 
+    mutate(day=floor_date(as_datetime(timestamp),"day")) %>%
+    left_join(b_t, by="day") %>%
+    mutate(b_t=replace_na(b_t,0)) %>% #Replacing NA values with 0
+    group_by(genres) %>%
+    summarise(b_g=(sum(rating-b_i-b_u-b_t-mu))/(n()),se = sd(rating)/sqrt(n())) %>%
+    filter(se<=s_e)
+    
+# Predicitng the ratings on the validation set
+predicted_ratings <- validation %>% 
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(day=floor_date(as_datetime(timestamp),"day")) %>% 
+    left_join(b_t, by="day") %>%
+    mutate(b_t=replace_na(b_t,0)) %>% #Replacing NA values with 0
+    left_join(b_g, by="genres") %>%
+    mutate(b_g=replace_na(b_g,0)) %>% #Replacing NA values with 0
+    mutate(pred = mu + b_i + b_u + b_t + b_g) %>%
+    .$pred
+
+# Calculating RMSE for predictions made on validation set     
+RMSE_final <- RMSE(predicted_ratings, validation$rating)
+RMSE_final
+
+```
+
+We see that the RMSE on the final validation set is 0.8638923
+
+
+# Conclusion
+
+For this MovieLens Recommendation system, we used a model that incorporates Movie, User, Time and Genre Effects combined with regularisation to make the final predictions. This model has the advantages of being fast, computationaly less intensive and easily scalable.
+
+As shown in the plot below, we can see that the year of release of the movie also seems to have a slight effect on the ratings of the movies. Thereby, we could have incorporated a least squares estimate of the 'Year of movie release' effect as well to make a slight improvement on the RMSE. However, this could have increased the computation time by a fair amount.
+
+```{r year_movie_average, fig.width=6, fig.height=3, echo=FALSE}
+# Group ratings by year of release and plot the the smoothed conditional mean over the years
+edx %>% mutate(year=str_extract(title,pattern = "\\(\\d{4}\\)")) %>% 
+  mutate(year=as.integer(str_extract(year,pattern="\\d{4}"))) %>% 
+  group_by(year) %>%
+  summarise(mean=mean(rating)) %>% 
+  ggplot(aes(year,mean)) + 
+  geom_smooth(method = 'loess',formula= 'y ~ x') +
+  xlab("Year Of Movie Release") +
+  ggtitle("Average Rating of Movies grouped by Year Of Release")
+  
+```
+
+Also, all the estimates of the time and genre effects are not user and movie specific, but are rather generalised across all users and movies. While generalising these effects is better than not accounting for them at all, if were to do a user and movie-specific analysis, our RMSEs would reduce by a much more substantial amount. However, a user and movie specific analysis would be much more compute intensive as there are close to 70,000 users and over 10,000 movies.
+
+Other methods of analysis such as Principal Component Analysis and Singular Value Decomposition could have proved to be much more accurate. However, again, becuase of the sheer size of the provided dataset (over 10 Million entries), these analayses would end up being extremely compute intensive. Since the code has to run on unknown computers for peer grading, they were avoided.
+
